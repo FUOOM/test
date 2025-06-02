@@ -1,0 +1,164 @@
+# ... (keep all your existing imports)
+
+# === ENHANCED CONSTANTS ===
+SYMBOLS = ["EURUSD", "GBPUSD", "USDJPY"]
+MAX_RETRIES = 3  # For API calls
+RETRY_DELAY = 5  # Seconds between retries
+
+def safe_yf_download(symbol, **kwargs):
+    """Wrapper with retry logic for Yahoo Finance"""
+    for attempt in range(MAX_RETRIES):
+        try:
+            data = yf.download(symbol, **kwargs)
+            if not data.empty:
+                return data
+            time.sleep(RETRY_DELAY)
+        except Exception as e:
+            logging.warning(f"YF download attempt {attempt+1} failed: {str(e)}")
+            time.sleep(RETRY_DELAY)
+    return None
+
+def robust_mt5_operation(func, *args, **kwargs):
+    """Wrapper with retry and connection check for MT5"""
+    for attempt in range(MAX_RETRIES):
+        try:
+            if not mt5.initialize():
+                mt5.shutdown()
+                time.sleep(RETRY_DELAY)
+                continue
+            result = func(*args, **kwargs)
+            if result is not None:
+                return result
+            time.sleep(RETRY_DELAY)
+        except Exception as e:
+            logging.warning(f"MT5 operation attempt {attempt+1} failed: {str(e)}")
+            time.sleep(RETRY_DELAY)
+    return None
+
+def get_mt5_data(symbol, timeframe, count):
+    """Enhanced with retry logic"""
+    return robust_mt5_operation(mt5.copy_rates_from_pos, symbol, timeframe, 0, count)
+
+def get_yahoo_data(symbol, interval='5m', lookback_days=5):
+    """Enhanced version with fallback"""
+    try:
+        end = datetime.now()
+        start = end - pd.Timedelta(days=lookback_days)
+        df = safe_yf_download(
+            symbol,
+            start=start,
+            end=end,
+            interval=interval,
+            progress=False,
+            auto_adjust=False
+        )
+        if df is None:
+            return None
+        df.index = df.index.tz_localize(None)
+        df.rename(columns=lambda x: f'yf_{x.lower()}', inplace=True)
+        return df
+    except Exception as e:
+        logging.error(f"Yahoo data fetch failed: {str(e)}")
+        return None
+
+def health_check():
+    """Check all critical systems"""
+    if not mt5.initialize():
+        logging.error("MT5 connection check failed")
+        return False
+    
+    # Verify we can get at least one symbol's data
+    for symbol in SYMBOLS:
+        data = get_mt5_data(symbol, TIMEFRAME, 1)
+        if data is None:
+            logging.error(f"MT5 data check failed for {symbol}")
+            return False
+    
+    # Verify Yahoo Finance connectivity
+    dxy_data = get_yahoo_data('DX-Y.NYB', interval='5m', lookback_days=1)
+    if dxy_data is None:
+        logging.warning("Yahoo Finance check failed (proceeding without external data)")
+    
+    return True
+
+def main_loop():
+    if not health_check():
+        logging.critical("Health check failed. Cannot start trading.")
+        return
+
+    try:
+        prev_bar_times = {s: None for s in SYMBOLS}
+        while True:
+            if not check_risk_limits():
+                break
+
+            for symbol in SYMBOLS:
+                try:
+                    print(f"\nProcessing {symbol}...")
+                    logging.info(f"Processing {symbol}...")
+                    
+                    # Get data with enhanced reliability
+                    df = get_mt5_data(symbol, TIMEFRAME, BAR_COUNT)
+                    if df is None or df.empty:
+                        logging.error(f"No MT5 data for {symbol}")
+                        continue
+
+                    # External data (with fallback)
+                    dxy_yahoo = get_yahoo_data('DX-Y.NYB')
+                    if dxy_yahoo is not None:
+                        df = merge_external_with_mt5(df, dxy_yahoo[['yf_close']])
+                        df.rename(columns={'yf_close': 'dxy_close'}, inplace=True)
+                    else:
+                        df['dxy_close'] = np.nan
+                        logging.warning(f"No DXY data for {symbol}")
+
+                    # Feature engineering
+                    df = make_hft_features(df)
+                    if df.empty:
+                        logging.error(f"Feature engineering failed for {symbol}")
+                        continue
+
+                    df = label_maker(df)
+                    last_bar_time = df.index[-1]
+
+                    # Model training/update logic
+                    if symbol not in model_dict or prev_bar_times[symbol] != last_bar_time:
+                        logging.info(f"Retraining model for {symbol}")
+                        try:
+                            model, scaler, features = train_xgb(df)
+                            model_dict[symbol] = (model, scaler, features, datetime.now(), last_bar_time)
+                            prev_bar_times[symbol] = last_bar_time
+                        except Exception as e:
+                            logging.error(f"Model training failed for {symbol}: {str(e)}")
+                            continue
+
+                    # Prediction and trading
+                    model, scaler, features, _, _ = model_dict[symbol]
+                    last = df.iloc[-1]
+                    X_pred = scaler.transform(last[features].values.reshape(1, -1))
+                    y_pred = int(model.predict(X_pred)[0])
+                    
+                    # Trade execution with enhanced checks
+                    positions = robust_mt5_operation(mt5.positions_get, symbol=symbol) or []
+                    if positions and len(positions) > 0:
+                        pos_type = positions[0].type
+                        if (y_pred == 1 and pos_type == mt5.ORDER_TYPE_SELL) or (y_pred == 0 and pos_type == mt5.ORDER_TYPE_BUY):
+                            logging.info(f"Signal reversal detected for {symbol}")
+                            close_trade(symbol)
+                            execute_trade(symbol, y_pred)
+                    else:
+                        execute_trade(symbol, y_pred)
+
+                except Exception as e:
+                    logging.error(f"Error processing {symbol}: {str(e)}", exc_info=True)
+                    continue
+
+            time.sleep(60)
+
+    except KeyboardInterrupt:
+        logging.info("Bot stopped by user")
+    except Exception as e:
+        logging.critical(f"Fatal error: {str(e)}", exc_info=True)
+    finally:
+        mt5.shutdown()
+        logging.info("Bot shutdown complete")
