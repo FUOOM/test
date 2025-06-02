@@ -1,0 +1,16 @@
+def get_yahoo_data(symbol, interval='5m', lookback_days=5):
+    import yfinance as yf
+    from datetime import datetime
+    import pandas as pd
+    end = datetime.now()
+    start = end - pd.Timedelta(days=lookback_days)
+    df = yf.download(symbol, start=start, end=end, interval=interval, progress=False)
+    if df.empty:
+        return None
+    # Flatten MultiIndex if needed
+    if isinstance(df.index, pd.MultiIndex):
+        df = df.reset_index(level=1, drop=True)
+    df.index = pd.to_datetime(df.index)
+    df.index = df.index.tz_localize(None)
+    df.rename(columns=lambda x: f'yf_{x.lower()}', inplace=True)
+    return df
