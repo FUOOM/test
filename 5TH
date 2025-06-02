@@ -1,0 +1,34 @@
+import uuid
+import logging
+
+# Create a class to properly use 'self'
+class MyClass:
+    def __init__(self):
+        # Now self is properly defined within a class method
+        self.session_id = str(uuid.uuid4())[:8]
+        
+        # Set up logging with the session ID
+        logger = logging.getLogger(__name__)
+        handler = logging.StreamHandler()
+        
+        # Create a filter to add session_id to the log record
+        class SessionFilter(logging.Filter):
+            def __init__(self, session_id):
+                self.session_id = session_id
+                
+            def filter(self, record):
+                record.session_id = self.session_id
+                return True
+        
+        # Update formatter to include session ID
+        formatter = logging.Formatter('%(asctime)s - %(name)s - [%(session_id)s] - %(levelname)s - %(message)s')
+        handler.setFormatter(formatter)
+        
+        # Add the filter and handler to the logger
+        logger.addFilter(SessionFilter(self.session_id))
+        logger.addHandler(handler)
+        
+        self.logger = logger
+
+# Example usage
+my_instance = MyClass()
